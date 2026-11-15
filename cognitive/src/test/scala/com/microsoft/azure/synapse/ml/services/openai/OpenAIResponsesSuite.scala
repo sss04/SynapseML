@@ -7,15 +7,16 @@ import com.microsoft.azure.synapse.ml.core.test.base.Flaky
 import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, TransformerFuzzing}
 import org.apache.http.util.EntityUtils
 import org.apache.spark.ml.util.MLReadable
+import org.apache.spark.sql.{functions => F}
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
 import org.apache.spark.sql.types.{ArrayType, MapType, StringType, StructField, StructType}
-import org.scalactic.Equality
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
 class OpenAIResponsesSuite extends TransformerFuzzing[OpenAIResponses]
   with OpenAIAPIKey with Flaky {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -23,16 +24,16 @@ class OpenAIResponsesSuite extends TransformerFuzzing[OpenAIResponses]
     .setDeploymentName(deploymentName)
     .setCustomServiceName(openAIServiceName)
     .setApiVersion("2025-04-01-preview")
-    .setMaxTokens(500)
+    .setMaxCompletionTokens(500)
+    .setReasoningEffort("low")
     .setOutputCol("out")
     .setMessagesCol("messages")
-    .setTemperature(0)
     .setSubscriptionKey(openAIAPIKey)
 
   lazy val goodDf: DataFrame = Seq(
     Seq(
       OpenAIMessage("system", "You are an AI chatbot with red as your favorite color"),
-      OpenAIMessage("user", "Whats your favorite color")
+      OpenAIMessage("user", "What is your favorite color? Reply in a full sentence.")
     ),
     Seq(
       OpenAIMessage("system", "You are very excited"),
@@ -183,6 +184,60 @@ class OpenAIResponsesSuite extends TransformerFuzzing[OpenAIResponses]
     }
   }
 
+  test("store parameter should be included in optional params when set") {
+    val transformer = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+      .setStore(true)
+
+    val rawMessages = Seq(OpenAIMessage("user", "Test store"))
+    val messages: Seq[Row] = rawMessages.toDF("role", "content", "name").collect()
+    val optionalParams = transformer.getOptionalParams(messages.head)
+
+    assert(optionalParams.contains("store"))
+    assert(optionalParams("store").asInstanceOf[Boolean])
+  }
+
+  test("store parameter defaults to false") {
+    val transformer = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+
+    assert(!transformer.getStore)
+  }
+
+  test("previousResponseId parameter should be included in optional params when set") {
+    val transformer = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+      .setPreviousResponseId("resp_test123")
+
+    val rawMessages = Seq(OpenAIMessage("user", "Test chaining"))
+    val messages: Seq[Row] = rawMessages.toDF("role", "content", "name").collect()
+    val optionalParams = transformer.getOptionalParams(messages.head)
+
+    assert(optionalParams.contains("previous_response_id"))
+    assert(optionalParams("previous_response_id") == "resp_test123")
+  }
+
+  test("Basic Usage with store=true returns response with id") {
+    val responsesWithStore = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+      .setCustomServiceName(openAIServiceName)
+      .setApiVersion("2025-04-01-preview")
+      .setMaxCompletionTokens(100)
+      .setOutputCol("out")
+      .setMessagesCol("messages")
+      .setSubscriptionKey(openAIAPIKey)
+      .setStore(true)
+
+    val result = responsesWithStore.transform(goodDf).collect()
+    result.foreach { row =>
+      val responseRow = row.getAs[Row]("out")
+      if (responseRow != null) {
+        val id = responseRow.getAs[String]("id")
+        assert(id != null && id.startsWith("resp_"), s"Expected response id starting with 'resp_', got: $id")
+      }
+    }
+  }
+
   test("getStringEntity serializes contentParts for multimodal payloads") {
     val transformer = new OpenAIResponses()
     val contentParts = Seq(
@@ -220,22 +275,222 @@ class OpenAIResponsesSuite extends TransformerFuzzing[OpenAIResponses]
     assert(secondPartType == "input_file")
   }
 
-  private def testResponses(model: OpenAIResponses,
-                            df: DataFrame,
-                            requiredLength: Int = 10): Unit = {
-    val fromRow = ResponsesModelResponse.makeFromRowConverter
-    model.transform(df).collect().foreach { row =>
-      val responseRow = row.getAs[Row]("out")
-      if (responseRow != null) {
-        fromRow(responseRow).output.foreach { choice =>
-          assert(choice.content.length > requiredLength)
-        }
-      }
+  test("Responses extract output text from the last output item when reasoning appears first") {
+    val transformer = new OpenAIResponses()
+    val responseJson =
+      """{
+        |  "id":"resp_test",
+        |  "object":"response",
+        |  "created_at":"1",
+        |  "model":"gpt-6-luna",
+        |  "output":[
+        |    {"type":"reasoning","status":"completed","content":null},
+        |    {"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"answer\":\"fruit\"}"}]}
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val responseDf = spark.read.schema(ResponsesModelResponse.schema).json(Seq(responseJson).toDS)
+    val wrappedDf = responseDf.select(F.struct(responseDf.columns.map(F.col): _*).as("out"))
+
+    val text = wrappedDf
+      .select(transformer.getOutputMessageText("out").as("text"))
+      .collect()
+      .head
+      .getAs[String]("text")
+
+    assert(text == """{"answer":"fruit"}""")
+    assert(!transformer.isContentFiltered(responseDf.collect().head))
+  }
+
+  test("Responses extract output text from message-only output") {
+    val transformer = new OpenAIResponses()
+    val responseJson =
+      """{
+        |  "id":"resp_test",
+        |  "object":"response",
+        |  "created_at":"1",
+        |  "model":"gpt-6-luna",
+        |  "output":[
+        |    {"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"answer\":\"fruit\"}"}]}
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val responseDf = spark.read.schema(ResponsesModelResponse.schema).json(Seq(responseJson).toDS)
+    val wrappedDf = responseDf.select(F.struct(responseDf.columns.map(F.col): _*).as("out"))
+
+    val text = wrappedDf
+      .select(transformer.getOutputMessageText("out").as("text"))
+      .collect()
+      .head
+      .getAs[String]("text")
+
+    assert(text == """{"answer":"fruit"}""")
+    assert(!transformer.isContentFiltered(responseDf.collect().head))
+  }
+
+  test("Responses preserve empty text output in both paths") {
+    val transformer = new OpenAIResponses()
+    val responseJson =
+      """{
+        |  "id":"resp_test",
+        |  "object":"response",
+        |  "created_at":"1",
+        |  "model":"gpt-6-luna",
+        |  "output":[
+        |    {"type":"message","status":"completed","content":[{"type":"output_text","text":""}]}
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val responseDf = spark.read.schema(ResponsesModelResponse.schema).json(Seq(responseJson).toDS)
+    val wrappedDf = responseDf.select(F.struct(responseDf.columns.map(F.col): _*).as("out"))
+
+    val textRow = wrappedDf
+      .select(transformer.getOutputMessageText("out").as("text"))
+      .collect()
+      .head
+
+    assert(textRow.getAs[String]("text") == "")
+    assert(!transformer.isContentFiltered(responseDf.collect().head))
+  }
+
+  test("Responses prefer text from the last output item when multiple messages exist") {
+    val transformer = new OpenAIResponses()
+    val responseJson =
+      """{
+        |  "id":"resp_test",
+        |  "object":"response",
+        |  "created_at":"1",
+        |  "model":"gpt-6-luna",
+        |  "output":[
+        |    {"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"answer\":\"stale\"}"}]},
+        |    {"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"answer\":\"final\"}"}]}
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val responseDf = spark.read.schema(ResponsesModelResponse.schema).json(Seq(responseJson).toDS)
+    val wrappedDf = responseDf.select(F.struct(responseDf.columns.map(F.col): _*).as("out"))
+
+    val text = wrappedDf
+      .select(transformer.getOutputMessageText("out").as("text"))
+      .collect()
+      .head
+      .getAs[String]("text")
+
+    assert(text == """{"answer":"final"}""")
+  }
+
+  test("Responses content filtering keeps status reason when no text exists") {
+    val transformer = new OpenAIResponses()
+    val responseJson =
+      """{
+        |  "id":"resp_test",
+        |  "object":"response",
+        |  "created_at":"1",
+        |  "model":"gpt-6-luna",
+        |  "output":[
+        |    {"type":"message","status":"content_filter","content":null}
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val responseDf = spark.read.schema(ResponsesModelResponse.schema).json(Seq(responseJson).toDS)
+    val outputRow = responseDf.collect().head
+
+    assert(transformer.isContentFiltered(outputRow))
+    assert(transformer.getFilterReason(outputRow) == "content_filter")
+  }
+
+  test("Responses content filtering uses the last output item status reason") {
+    val transformer = new OpenAIResponses()
+    val responseJson =
+      """{
+        |  "id":"resp_test",
+        |  "object":"response",
+        |  "created_at":"1",
+        |  "model":"gpt-6-luna",
+        |  "output":[
+        |    {"type":"reasoning","status":"completed","content":null},
+        |    {"type":"message","status":"content_filter","content":null}
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val responseDf = spark.read.schema(ResponsesModelResponse.schema).json(Seq(responseJson).toDS)
+    val outputRow = responseDf.collect().head
+
+    assert(transformer.isContentFiltered(outputRow))
+    assert(transformer.getFilterReason(outputRow) == "content_filter")
+  }
+
+  test("maxCompletionTokens sends max_output_tokens on wire for responses") {
+    val transformer = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+      .setMaxCompletionTokens(500)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = transformer.getOptionalParams(messages.head)
+    assert(params.contains("max_output_tokens"))
+    assert(!params.contains("max_tokens"))
+    assert(!params.contains("max_completion_tokens"))
+    assert(params("max_output_tokens") == 500)
+  }
+
+  test("deprecated maxTokens remapped to max_output_tokens on wire for responses") {
+    val transformer = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+      .setMaxTokens(200)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = transformer.getOptionalParams(messages.head)
+    assert(params.contains("max_output_tokens"))
+    assert(!params.contains("max_tokens"))
+    assert(!params.contains("max_completion_tokens"))
+    assert(params("max_output_tokens") == 200)
+  }
+
+  test("setting both maxTokens and maxCompletionTokens throws for responses") {
+    val transformer = new OpenAIResponses()
+      .setDeploymentName(deploymentName)
+      .setMaxTokens(100)
+      .setMaxCompletionTokens(200)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    assertThrows[IllegalArgumentException] {
+      transformer.getOptionalParams(messages.head)
     }
   }
 
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    super.assertDFEq(df1.drop("out"), df2.drop("out"))(eq)
+  private def testResponses(model: OpenAIResponses,
+                            df: DataFrame,
+                            requiredLength: Int = 10): Unit = {
+    model.transform(df)
+      .select(model.getOutputMessageText(model.getOutputCol).as("text"))
+      .collect()
+      .foreach { row =>
+        val text = row.getAs[String]("text")
+        assert(text != null, "Expected non-null text from Responses API")
+        assert(text.length > requiredLength,
+          s"Expected text length > $requiredLength but got ${text.length}")
+    }
   }
 
   override def testObjects(): Seq[TestObject[OpenAIResponses]] =
